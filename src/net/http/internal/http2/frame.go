@@ -347,6 +347,24 @@ type Framer struct {
 	debugWriteLoggerf func(string, ...any)
 
 	frameCache *frameCache // always non-nil; see frameCache documentation
+
+	// metaFields holds the backing array reused for
+	// MetaHeadersFrame.Fields across ReadFrame calls. The Framer
+	// resets it to length zero at the start of each readMetaFrame and
+	// recaptures the (possibly grown) slice on success. This avoids
+	// reallocating the Fields slice for every HEADERS frame parsed.
+	//
+	// Reuse is safe because the MetaHeadersFrame.Fields documentation
+	// already requires callers not to retain the slice past the next
+	// ReadFrame, and the package's only consumers
+	// ((*serverConn).processHeaders and
+	// (*clientConnReadLoop).processHeaders) copy each field's strings
+	// into their own header map before returning. The hpack decoder
+	// hands out independent Go strings for Name and Value (they are
+	// allocated fresh per decode, or referenced from the dynamic
+	// table), so reusing the slice does not invalidate strings held
+	// by earlier callers.
+	metaFields []hpack.HeaderField
 }
 
 func (fr *Framer) maxHeaderListSize() uint32 {
@@ -1738,6 +1756,21 @@ func (fr *Framer) maxHeaderStringLen() int {
 	return v
 }
 
+// captureMetaFields is deferred by readMetaFrame and runs on every
+// return path. It stashes the possibly-grown Fields backing slice
+// for reuse on the next call, but drops it when the cap exceeds the
+// retention threshold so a single oversized HEADERS frame — including
+// one that aborted mid-parse — cannot permanently inflate
+// per-connection memory.
+func (fr *Framer) captureMetaFields(mh *MetaHeadersFrame) {
+	const maxRetainedFields = 64
+	if cap(mh.Fields) > maxRetainedFields {
+		fr.metaFields = nil
+	} else {
+		fr.metaFields = mh.Fields
+	}
+}
+
 // readMetaFrame returns 0 or more CONTINUATION frames from fr and
 // merge them into the provided hf and returns a MetaHeadersFrame
 // with the decoded hpack values.
@@ -1745,9 +1778,24 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	if fr.AllowIllegalReads {
 		return nil, errors.New("illegal use of AllowIllegalReads with ReadMetaHeaders")
 	}
+	// Release any HeaderField references retained from a previous
+	// readMetaFrame call before reusing the backing array. Header
+	// values can contain secrets (Cookie, Authorization, fields with
+	// HPACK Sensitive=true) and the slice slot beyond the new len
+	// would otherwise keep them reachable for the lifetime of the
+	// connection.
+	clear(fr.metaFields[:cap(fr.metaFields)])
 	mh := &MetaHeadersFrame{
 		HeadersFrame: hf,
+		Fields:       fr.metaFields[:0],
 	}
+	// Capture/cap the (possibly grown) Fields backing slice on every
+	// return path — including early errors. Otherwise an aborted parse
+	// that grew the slice past the retention threshold would leave
+	// fr.metaFields holding the previous successful call's backing
+	// indefinitely, because the abort-path code below skips this
+	// step. A simple method-call defer is open-coded.
+	defer fr.captureMetaFields(mh)
 	var remainSize = fr.maxHeaderListSize()
 	var sawRegular bool
 
