@@ -1406,6 +1406,249 @@ func readAndVerifyDataFrame(data string, length byte, fr *Framer, buf *bytes.Buf
 	return df
 }
 
+// TestReadMetaFrameReusesFieldsSlice verifies that readMetaFrame
+// reuses the backing array of MetaHeadersFrame.Fields across calls,
+// avoiding a fresh allocation per HEADERS frame parsed. The
+// MetaHeadersFrame documentation already requires callers not to
+// retain the slice past the next ReadFrame, and the package's
+// consumers ((*serverConn).processHeaders and
+// (*clientConnReadLoop).processHeaders) copy field strings into
+// their own header maps synchronously before returning, so reuse is
+// safe.
+func TestReadMetaFrameReusesFieldsSlice(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	writeMeta := func(streamID uint32, fields ...string) {
+		t.Helper()
+		block := encodeHeaderRaw(t, fields...)
+		if err := fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: block,
+			EndHeaders:    true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	readMeta := func() *MetaHeadersFrame {
+		t.Helper()
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mh, ok := f.(*MetaHeadersFrame)
+		if !ok {
+			t.Fatalf("got %T, want *MetaHeadersFrame", f)
+		}
+		return mh
+	}
+
+	// First read populates the cached slice.
+	writeMeta(1, ":method", "GET", ":path", "/a", ":scheme", "http", ":authority", "x")
+	mh1 := readMeta()
+	if len(mh1.Fields) != 4 {
+		t.Fatalf("first parse: got %d fields, want 4", len(mh1.Fields))
+	}
+	backing1 := unsafe.SliceData(mh1.Fields)
+
+	// Second read of the same shape must reuse the backing array.
+	writeMeta(3, ":method", "POST", ":path", "/b", ":scheme", "https", ":authority", "y")
+	mh2 := readMeta()
+	if len(mh2.Fields) != 4 {
+		t.Fatalf("second parse: got %d fields, want 4", len(mh2.Fields))
+	}
+	if backing := unsafe.SliceData(mh2.Fields); backing != backing1 {
+		t.Errorf("Fields backing array changed between reads: have %p, want %p", backing, backing1)
+	}
+	// The retained mh1 pointer now sees the second read's values,
+	// because the slice is shared. Document that.
+	if mh1.Fields[0].Name != mh2.Fields[0].Name {
+		t.Errorf("retained mh1 view: mh1.Fields[0].Name = %q, mh2.Fields[0].Name = %q; expected equal after reuse",
+			mh1.Fields[0].Name, mh2.Fields[0].Name)
+	}
+
+	// A larger read may grow the slice; capture the new backing array
+	// and confirm a subsequent equal-size read reuses *that*.
+	writeMeta(5,
+		":method", "GET", ":path", "/c", ":scheme", "http", ":authority", "z",
+		"x-a", "1", "x-b", "2", "x-c", "3", "x-d", "4")
+	mh3 := readMeta()
+	if len(mh3.Fields) != 8 {
+		t.Fatalf("third parse: got %d fields, want 8", len(mh3.Fields))
+	}
+	backing3 := unsafe.SliceData(mh3.Fields)
+
+	writeMeta(7,
+		":method", "GET", ":path", "/d", ":scheme", "http", ":authority", "z",
+		"x-a", "5", "x-b", "6", "x-c", "7", "x-d", "8")
+	mh4 := readMeta()
+	if backing := unsafe.SliceData(mh4.Fields); backing != backing3 {
+		t.Errorf("Fields backing array changed after equal-size read: have %p, want %p", backing, backing3)
+	}
+}
+
+// TestReadMetaFrameFieldsCacheAllocs verifies that the Fields slice
+// no longer reallocates per parse. The remaining allocations belong
+// to the MetaHeadersFrame struct, the SetEmitFunc closure, and the
+// HeadersFrame struct (those are addressed by separate CLs); this
+// test isolates the parse path so the Fields-slice change is visible.
+func TestReadMetaFrameFieldsCacheAllocs(t *testing.T) {
+	// Pre-encode many distinct HEADERS frames into a single buffer so
+	// each ReadFrame call consumes a fresh one (the hpack encoder is
+	// stateful, so we can't replay the same bytes).
+	const numFrames = 30
+	var wireBuf bytes.Buffer
+	wfr := NewFramer(&wireBuf, nil)
+	for i := 0; i < numFrames; i++ {
+		block := encodeHeaderRaw(t,
+			":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+		if err := wfr.WriteHeaders(HeadersFrameParam{
+			StreamID:      uint32(2*i + 1),
+			BlockFragment: block,
+			EndHeaders:    true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded := wireBuf.Bytes()
+
+	rbuf := bytes.NewReader(encoded)
+	fr := NewFramer(io.Discard, rbuf)
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	// Warm up: first read allocates the Fields backing array.
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure the steady-state per-parse allocations. The Fields
+	// slice is the cache target; remaining allocs come from sources
+	// other CLs in this series address.
+	const runs = numFrames - 1
+	allocs := testing.AllocsPerRun(runs-1, func() {
+		if _, err := fr.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Expected steady-state allocs in steady state with this CL:
+	//   1 *HeadersFrame struct (parseHeadersFrame)
+	//   1 *MetaHeadersFrame struct
+	//   4 from the SetEmitFunc closure: the closure value itself plus
+	//     three hoisted-to-heap captured locals (remainSize,
+	//     sawRegular, invalid) — addressed by a separate CL that
+	//     converts the closure to a Framer method.
+	// = 6 total. Without the Fields-slice cache this would be 7
+	// (a fresh backing array per parse). The test guards both
+	// directions: a regression beyond 6 means Fields is reallocating
+	// again (or a new alloc was introduced elsewhere).
+	if allocs > 6 {
+		t.Errorf("readMetaFrame allocs/op = %v; want <= 6 after Fields cache warmup (regression from Fields slice or new alloc?)", allocs)
+	}
+}
+
+// TestReadMetaFrameFieldsClearsSensitiveTail verifies that the slot
+// at the end of the cached Fields backing array (beyond the new
+// MetaHeadersFrame.Fields' len) does NOT retain HeaderField string
+// references from the previous request. Without this clearing,
+// secret header values (Cookie, Authorization, HPACK Sensitive=true)
+// stay reachable for the lifetime of the connection any time a
+// shorter HEADERS frame follows a longer one.
+func TestReadMetaFrameFieldsClearsSensitiveTail(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	writeMeta := func(streamID uint32, fields ...string) {
+		t.Helper()
+		block := encodeHeaderRaw(t, fields...)
+		if err := fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: block,
+			EndHeaders:    true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First HEADERS includes a "sensitive" value we want to be sure is
+	// not retained after the next, shorter parse.
+	const secret = "TOKEN_THAT_MUST_NOT_LEAK"
+	writeMeta(1,
+		":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x",
+		"authorization", secret,
+		"cookie", "session="+secret)
+	first, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstWU := first.(*MetaHeadersFrame)
+	// Sanity: the secret is in the slice.
+	foundSecret := false
+	for _, hf := range firstWU.Fields {
+		if hf.Value == secret || hf.Value == "session="+secret {
+			foundSecret = true
+		}
+	}
+	if !foundSecret {
+		t.Fatalf("test setup: secret value not found in first parse")
+	}
+	backing := unsafe.SliceData(firstWU.Fields)
+	cap1 := cap(firstWU.Fields)
+	if cap1 < 6 {
+		t.Fatalf("test setup: expected backing array cap >= 6, got %d", cap1)
+	}
+
+	// Second HEADERS with only 4 fields. The cache slot at indices
+	// 4..cap1-1 must NOT still hold the secret strings.
+	writeMeta(3, ":method", "POST", ":path", "/p", ":scheme", "http", ":authority", "y")
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inspect every slot in the backing array via unsafe.Slice so we
+	// see the tail beyond the new MetaHeadersFrame.Fields' len.
+	tail := unsafe.Slice(backing, cap1)
+	for i, hf := range tail {
+		if strings.Contains(hf.Name, "authorization") ||
+			strings.Contains(hf.Name, "cookie") ||
+			strings.Contains(hf.Value, secret) {
+			t.Errorf("backing slot %d still holds sensitive data: %+v", i, hf)
+		}
+	}
+}
+
+// TestReadMetaFrameFieldsRetentionCap verifies that a single large
+// HEADERS frame does not permanently inflate per-Framer memory: the
+// cached slice's capacity is dropped above maxRetainedFields, so
+// subsequent reads start with a fresh, small backing array.
+func TestReadMetaFrameFieldsRetentionCap(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+	// Allow large header lists for this test.
+	fr.MaxHeaderListSize = 1 << 20
+
+	// Send one HEADERS frame with many fields to grow the cache cap.
+	bigFields := []string{":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x"}
+	for i := 0; i < 200; i++ {
+		bigFields = append(bigFields, fmt.Sprintf("x-h-%d", i), "v")
+	}
+	block := encodeHeaderRaw(t, bigFields...)
+	if err := fr.WriteHeaders(HeadersFrameParam{
+		StreamID: 1, BlockFragment: block, EndHeaders: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The cap should have been dropped because it exceeded the
+	// internal threshold; the next read starts from nil.
+	if got, max := cap(fr.metaFields), 64; got > max {
+		t.Errorf("after large parse, cap(fr.metaFields) = %d; want <= %d (retention cap)", got, max)
+	}
+}
+
 func encodeHeaderRaw(t testing.TB, headers ...string) []byte {
 	var buf bytes.Buffer
 	enc := hpack.NewEncoder(&buf)
