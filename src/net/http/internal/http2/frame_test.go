@@ -1531,19 +1531,18 @@ func TestReadMetaFrameFieldsCacheAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	// Expected steady-state allocs in steady state with this CL:
+	// Expected steady-state allocs after both this CL and the
+	// closure-to-method CL:
 	//   1 *HeadersFrame struct (parseHeadersFrame)
 	//   1 *MetaHeadersFrame struct
-	//   4 from the SetEmitFunc closure: the closure value itself plus
-	//     three hoisted-to-heap captured locals (remainSize,
-	//     sawRegular, invalid) — addressed by a separate CL that
-	//     converts the closure to a Framer method.
-	// = 6 total. Without the Fields-slice cache this would be 7
-	// (a fresh backing array per parse). The test guards both
-	// directions: a regression beyond 6 means Fields is reallocating
-	// again (or a new alloc was introduced elsewhere).
-	if allocs > 6 {
-		t.Errorf("readMetaFrame allocs/op = %v; want <= 6 after Fields cache warmup (regression from Fields slice or new alloc?)", allocs)
+	// = 2 total. Without the closure-to-method CL the count would be
+	// 6 (4 more from the SetEmitFunc closure value plus its three
+	// hoisted-to-heap captured locals). Without the Fields-slice
+	// cache it would be one higher still (a fresh backing array per
+	// parse).
+	t.Logf("readMetaFrame steady-state allocs/op = %v", allocs)
+	if allocs > 2 {
+		t.Errorf("readMetaFrame allocs/op = %v; want <= 2 after Fields cache + emit-method warmup (regression?)", allocs)
 	}
 }
 
@@ -1646,6 +1645,74 @@ func TestReadMetaFrameFieldsRetentionCap(t *testing.T) {
 	// internal threshold; the next read starts from nil.
 	if got, max := cap(fr.metaFields), 64; got > max {
 		t.Errorf("after large parse, cap(fr.metaFields) = %d; want <= %d (retention cap)", got, max)
+	}
+}
+
+// TestReadMetaFrameClearsMetaStateMH verifies that fr.metaState.mh is
+// cleared once readMetaFrame returns, so the just-returned
+// *MetaHeadersFrame is releasable by GC even if the connection is
+// then idle for a long time before the next HEADERS frame arrives.
+func TestReadMetaFrameClearsMetaStateMH(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	block := encodeHeaderRaw(t,
+		":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+	if err := fr.WriteHeaders(HeadersFrameParam{
+		StreamID: 1, BlockFragment: block, EndHeaders: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if fr.metaState.mh != nil {
+		t.Errorf("fr.metaState.mh = %p; want nil after readMetaFrame returns", fr.metaState.mh)
+	}
+}
+
+// TestEmitMetaFieldNilGuard verifies that calling emitMetaField with
+// no in-flight readMetaFrame (fr.metaState.mh == nil) is a safe
+// no-op rather than a panic or a write into stale state. This is the
+// defense-in-depth behavior the closure-to-method conversion relies
+// on for safety after the original "lose reference to
+// MetaHeadersFrame" defer was removed.
+func TestEmitMetaFieldNilGuard(t *testing.T) {
+	fr, _ := testFramer()
+	if fr.metaState.mh != nil {
+		t.Fatalf("test setup: fresh Framer should have nil metaState.mh")
+	}
+	// Calling without setting up readMetaFrame state must not panic
+	// or modify anything observable.
+	fr.emitMetaField(hpack.HeaderField{Name: "x", Value: "y"})
+	if fr.metaState.mh != nil {
+		t.Errorf("emitMetaField mutated metaState.mh: %p", fr.metaState.mh)
+	}
+}
+
+// TestReadMetaFrameClearsMetaStateInvalid verifies that the error
+// captured by emitMetaField in fr.metaState.invalid (which can wrap
+// an attacker-controlled header name) is dropped on return from
+// readMetaFrame, not held across idle periods.
+func TestReadMetaFrameClearsMetaStateInvalid(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	// Header name with uppercase chars triggers headerFieldNameError
+	// inside emitMetaField, which assigns fr.metaState.invalid.
+	block := encodeHeaderRaw(t,
+		":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x",
+		"CapitalBad", "v")
+	if err := fr.WriteHeaders(HeadersFrameParam{
+		StreamID: 1, BlockFragment: block, EndHeaders: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fr.ReadFrame(); err == nil {
+		t.Fatal("expected stream error for invalid header name")
+	}
+	if fr.metaState.invalid != nil {
+		t.Errorf("fr.metaState.invalid = %v; want nil after readMetaFrame returns", fr.metaState.invalid)
 	}
 }
 
