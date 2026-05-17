@@ -436,6 +436,7 @@ type frameCache struct {
 	dataFrame         DataFrame
 	windowUpdateFrame WindowUpdateFrame
 	headersFrame      HeadersFrame
+	metaHeadersFrame  MetaHeadersFrame
 }
 
 func (fc *frameCache) getDataFrame() *DataFrame {
@@ -457,6 +458,13 @@ func (fc *frameCache) getHeadersFrame() *HeadersFrame {
 		return &HeadersFrame{}
 	}
 	return &fc.headersFrame
+}
+
+func (fc *frameCache) getMetaHeadersFrame() *MetaHeadersFrame {
+	if fc == nil {
+		return &MetaHeadersFrame{}
+	}
+	return &fc.metaHeadersFrame
 }
 
 // NewFramer returns a Framer that writes frames to w and reads them from r.
@@ -1636,6 +1644,11 @@ type headersOrContinuation interface {
 //
 // This type of frame does not appear on the wire and is only returned
 // by the Framer when Framer.ReadMetaHeaders is set.
+//
+// When [Framer.SetReuseFrames] is in effect, the same *MetaHeadersFrame
+// is returned by every ReadFrame call that produces one and its fields
+// are overwritten on each call. Callers must consume Fields and
+// Truncated before the next ReadFrame and must not retain the pointer.
 type MetaHeadersFrame struct {
 	*HeadersFrame
 
@@ -1753,7 +1766,10 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	if fr.AllowIllegalReads {
 		return nil, errors.New("illegal use of AllowIllegalReads with ReadMetaHeaders")
 	}
-	mh := &MetaHeadersFrame{
+	mh := fr.frameCache.getMetaHeadersFrame()
+	// Wholesale reset so values from a previous parse (Fields,
+	// Truncated, or any future-added field) cannot leak through.
+	*mh = MetaHeadersFrame{
 		HeadersFrame: hf,
 	}
 	var remainSize = fr.maxHeaderListSize()
