@@ -484,9 +484,19 @@ func (fr *Framer) SetReuseFrames() {
 // value-type fields (FrameHeader and Increment), and all consumers in
 // this package extract those fields synchronously before the next
 // ReadFrame call.
+//
+// HeadersFrame reuse is always on for the same reason ReadMetaHeaders
+// always wraps the *HeadersFrame into a MetaHeadersFrame synchronously
+// within the same ReadFrame call before returning to a consumer:
+// when net/http's internal use of this package is the only path
+// exercised (i.e. ReadMetaHeaders != nil), the unwrapped
+// *HeadersFrame is never observable to consumers between calls. The
+// headerFragBuf slice aliases the framer's read buffer in either
+// case, matching DataFrame's existing contract.
 type frameCache struct {
 	dataFrame         DataFrame
 	windowUpdateFrame WindowUpdateFrame
+	headersFrame      HeadersFrame
 	reuseDataFrames   bool
 }
 
@@ -499,6 +509,10 @@ func (fc *frameCache) getDataFrame() *DataFrame {
 
 func (fc *frameCache) getWindowUpdateFrame() *WindowUpdateFrame {
 	return &fc.windowUpdateFrame
+}
+
+func (fc *frameCache) getHeadersFrame() *HeadersFrame {
+	return &fc.headersFrame
 }
 
 // NewFramer returns a Framer that writes frames to w and reads them from r.
@@ -1141,8 +1155,18 @@ func (f *HeadersFrame) HasPriority() bool {
 	return f.FrameHeader.Flags.Has(FlagHeadersPriority)
 }
 
-func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
-	hf := &HeadersFrame{
+// parseHeadersFrame populates the framer's cached HeadersFrame. As
+// with WindowUpdateFrame, the cache requires the function to assign
+// every field of HeadersFrame on the success path or stale data
+// from a previous frame would be observable to the next caller. If
+// a field is added to HeadersFrame, update both this function and
+// TestReadFrameHeadersOverwrites.
+func parseHeadersFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
+	hf := fc.getHeadersFrame()
+	// Zero every field so stale values from a previous HEADERS frame
+	// (Priority, headerFragBuf) cannot leak through. FrameHeader is
+	// replaced wholesale below.
+	*hf = HeadersFrame{
 		FrameHeader: fh,
 	}
 	if fh.StreamID == 0 {
