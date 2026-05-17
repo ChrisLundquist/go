@@ -497,6 +497,7 @@ type frameCache struct {
 	dataFrame         DataFrame
 	windowUpdateFrame WindowUpdateFrame
 	headersFrame      HeadersFrame
+	metaHeadersFrame  MetaHeadersFrame
 	reuseDataFrames   bool
 }
 
@@ -513,6 +514,10 @@ func (fc *frameCache) getWindowUpdateFrame() *WindowUpdateFrame {
 
 func (fc *frameCache) getHeadersFrame() *HeadersFrame {
 	return &fc.headersFrame
+}
+
+func (fc *frameCache) getMetaHeadersFrame() *MetaHeadersFrame {
+	return &fc.metaHeadersFrame
 }
 
 // NewFramer returns a Framer that writes frames to w and reads them from r.
@@ -1828,7 +1833,12 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	// would otherwise keep them reachable for the lifetime of the
 	// connection.
 	clear(fr.metaFields[:cap(fr.metaFields)])
-	mh := &MetaHeadersFrame{
+	mh := fr.frameCache.getMetaHeadersFrame()
+	// Reset every field so values from a previous (possibly aborted)
+	// parse cannot leak through. Fields and Truncated are the targets
+	// the prior CL series guarded; HeadersFrame is always the
+	// just-parsed cached pointer.
+	*mh = MetaHeadersFrame{
 		HeadersFrame: hf,
 		Fields:       fr.metaFields[:0],
 	}
