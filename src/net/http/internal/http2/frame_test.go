@@ -2171,3 +2171,149 @@ func TestTypeFrameParserHolePanic(t *testing.T) {
 		t.Errorf("got %T; want *UnknownFrame", f)
 	}
 }
+
+// BenchmarkParseDataFrame measures the per-parse cost of DATA
+// frames with and without SetReuseFrames. The DataFrame cache is the
+// preexisting one; this exists so its contribution can be compared
+// directly against the WindowUpdate/Headers/MetaHeaders caches added
+// in this stack.
+func BenchmarkParseDataFrame(b *testing.B) {
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteData(1, false, []byte("abc")); err != nil {
+		b.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	run := func(b *testing.B, reuse bool) {
+		rbuf := bytes.NewReader(encoded)
+		fr := NewFramer(io.Discard, rbuf)
+		if reuse {
+			fr.SetReuseFrames()
+		}
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rbuf.Reset(encoded)
+			if _, err := fr.ReadFrame(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("Default", func(b *testing.B) { run(b, false) })
+	b.Run("Reused", func(b *testing.B) { run(b, true) })
+}
+
+// BenchmarkParseWindowUpdateFrame measures the per-parse cost of
+// WINDOW_UPDATE frames with and without SetReuseFrames. The Default
+// case allocates a fresh *WindowUpdateFrame each call; Reused uses
+// the cached one.
+func BenchmarkParseWindowUpdateFrame(b *testing.B) {
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteWindowUpdate(1, 7); err != nil {
+		b.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	run := func(b *testing.B, reuse bool) {
+		rbuf := bytes.NewReader(encoded)
+		fr := NewFramer(io.Discard, rbuf)
+		if reuse {
+			fr.SetReuseFrames()
+		}
+		// Warm up the read buffer so its growth doesn't count.
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rbuf.Reset(encoded)
+			if _, err := fr.ReadFrame(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("Default", func(b *testing.B) { run(b, false) })
+	b.Run("Reused", func(b *testing.B) { run(b, true) })
+}
+
+// BenchmarkParseHeadersFrame measures HEADERS parsing with and
+// without SetReuseFrames.
+func BenchmarkParseHeadersFrame(b *testing.B) {
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: []byte("abc"),
+		EndHeaders:    true,
+	}); err != nil {
+		b.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	run := func(b *testing.B, reuse bool) {
+		rbuf := bytes.NewReader(encoded)
+		fr := NewFramer(io.Discard, rbuf)
+		if reuse {
+			fr.SetReuseFrames()
+		}
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rbuf.Reset(encoded)
+			if _, err := fr.ReadFrame(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("Default", func(b *testing.B) { run(b, false) })
+	b.Run("Reused", func(b *testing.B) { run(b, true) })
+}
+
+// BenchmarkReadMetaFrame measures HEADERS+HPACK decoding via
+// readMetaFrame with and without SetReuseFrames. With reuse, the
+// cached *HeadersFrame and *MetaHeadersFrame wrappers are both
+// eliminated from the allocation count.
+func BenchmarkReadMetaFrame(b *testing.B) {
+	block := encodeHeaderRaw(b, ":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: block,
+		EndHeaders:    true,
+	}); err != nil {
+		b.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	run := func(b *testing.B, reuse bool) {
+		rbuf := bytes.NewReader(encoded)
+		fr := NewFramer(io.Discard, rbuf)
+		fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+		if reuse {
+			fr.SetReuseFrames()
+		}
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rbuf.Reset(encoded)
+			if _, err := fr.ReadFrame(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.Run("Default", func(b *testing.B) { run(b, false) })
+	b.Run("Reused", func(b *testing.B) { run(b, true) })
+}
