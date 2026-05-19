@@ -662,6 +662,11 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	maxHeaderTableSize := uint32(conf.MaxDecoderHeaderTableSize)
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
 	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
+	if http2reuseframes.Value() == "0" {
+		http2reuseframes.IncNonDefault()
+	} else {
+		cc.fr.SetReuseFrames()
+	}
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(uint32(conf.MaxEncoderHeaderTableSize))
@@ -2626,6 +2631,13 @@ func (rl *clientConnReadLoop) processGoAway(f *GoAwayFrame) error {
 	if cc.goAwayDebug == "" {
 		cc.goAwayDebug = string(f.DebugData())
 	}
+	// debugData aliases the Framer's read buffer. SetReuseFrames does
+	// not cache GoAwayFrame today, so cc.goAway = f is safe, but we
+	// retain the *GoAwayFrame across ReadFrame calls; clear the only
+	// field that aliases the read buffer so a future addition of
+	// GoAwayFrame to frameCache cannot turn cc.goAway.DebugData() into
+	// a use-after-overwrite.
+	f.debugData = nil
 	if old != nil && old.ErrCode != ErrCodeNo {
 		cc.goAway.ErrCode = old.ErrCode
 	}

@@ -322,6 +322,11 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 	fr.ReadMetaHeaders = hpack.NewDecoder(uint32(conf.MaxDecoderHeaderTableSize), nil)
 	fr.MaxHeaderListSize = sc.maxHeaderListSize()
 	fr.SetMaxReadFrameSize(uint32(conf.MaxReadFrameSize))
+	if http2reuseframes.Value() == "0" {
+		http2reuseframes.IncNonDefault()
+	} else {
+		fr.SetReuseFrames()
+	}
 	sc.framer = fr
 
 	if tc, ok := c.(connectionStater); ok {

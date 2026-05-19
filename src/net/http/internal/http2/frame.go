@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"internal/godebug"
 	"io"
 	"log"
 	"slices"
@@ -21,6 +22,12 @@ import (
 
 	"golang.org/x/net/http/httpguts"
 )
+
+// http2reuseframes controls whether the per-connection Framer in the
+// stdlib server and Transport opts in to SetReuseFrames. Default is
+// reuse on; GODEBUG=http2reuseframes=0 reverts to allocating each
+// parsed frame fresh, matching the pre-CL behavior.
+var http2reuseframes = godebug.New("http2reuseframes")
 
 const frameHeaderLen = 9
 
