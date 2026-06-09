@@ -3489,6 +3489,59 @@ func BenchmarkClientResponseHeaders(b *testing.B) {
 	b.Run("1000 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 1000) })
 }
 
+// BenchmarkClientConcurrentRequests drives many concurrent requests
+// multiplexed over a shared connection. The sequential benchmarks
+// above cannot observe contention costs (connection-pool and
+// per-conn mutexes, flow-control synchronization, write-path
+// serialization): a regression there is invisible to them. The
+// parallelism subtests run GOMAXPROCS, 4x, and 16x concurrent
+// requesters.
+func BenchmarkClientConcurrentRequests(b *testing.B) {
+	for _, p := range []int{1, 4, 16} {
+		b.Run(fmt.Sprintf("parallelism=%2d", p), func(b *testing.B) {
+			benchConcurrentRequests(b, p)
+		})
+	}
+}
+
+func benchConcurrentRequests(b *testing.B, parallelism int) {
+	DisableGoroutineTracking(b)
+	b.ReportAllocs()
+	ts := newTestServer(b, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "hello")
+	}, optQuiet)
+
+	tr := newTransport(b)
+
+	b.SetParallelism(parallelism)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			req, err := http.NewRequest("GET", ts.URL, nil)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			res, err := tr.RoundTrip(req)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			if _, err := io.Copy(io.Discard, res.Body); err != nil {
+				res.Body.Close()
+				b.Error(err)
+				return
+			}
+			res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				b.Errorf("Response code = %v; want %v", res.StatusCode, http.StatusOK)
+				return
+			}
+		}
+	})
+}
+
 func BenchmarkDownloadFrameSize(b *testing.B) {
 	b.Run(" 16k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 16*1024) })
 	b.Run(" 64k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 64*1024) })
