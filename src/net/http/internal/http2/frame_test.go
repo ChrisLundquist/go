@@ -1016,6 +1016,129 @@ func TestReadFrameWindowUpdateDistinctWithoutReuse(t *testing.T) {
 	}
 }
 
+// TestReadFrameReusesRSTStream verifies that ReadFrame returns the
+// same *RSTStreamFrame pointer for every RST_STREAM parsed when
+// SetReuseFrames is in effect, with the fields of each new frame
+// fully overwriting the previous parse's.
+func TestReadFrameReusesRSTStream(t *testing.T) {
+	fr, buf := testFramer()
+	fr.SetReuseFrames()
+
+	if err := fr.WriteRSTStream(1, ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	first, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRST, ok := first.(*RSTStreamFrame)
+	if !ok {
+		t.Fatalf("first frame is %T, want *RSTStreamFrame", first)
+	}
+	if firstRST.StreamID != 1 || firstRST.ErrCode != ErrCodeCancel {
+		t.Fatalf("first RST_STREAM = %+v; want StreamID=1 ErrCode=CANCEL", firstRST)
+	}
+
+	cases := []struct {
+		streamID uint32
+		code     ErrCode
+	}{
+		{streamID: 3, code: ErrCodeProtocol},
+		{streamID: 5, code: ErrCodeNo},
+		{streamID: 3, code: ErrCodeCancel},
+	}
+	for i, tc := range cases {
+		buf.Reset()
+		if err := fr.WriteRSTStream(tc.streamID, tc.code); err != nil {
+			t.Fatal(err)
+		}
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rst, ok := f.(*RSTStreamFrame)
+		if !ok {
+			t.Fatalf("iter %d: frame is %T, want *RSTStreamFrame", i, f)
+		}
+		if rst != firstRST {
+			t.Errorf("iter %d: pointer changed: have %p, want %p", i, rst, firstRST)
+		}
+		if rst.StreamID != tc.streamID || rst.ErrCode != tc.code {
+			t.Errorf("iter %d: got %+v; want StreamID=%d ErrCode=%v",
+				i, rst, tc.streamID, tc.code)
+		}
+	}
+}
+
+// TestReadFrameRSTStreamNoAllocsWhenReused locks in the
+// zero-allocation invariant for the RST_STREAM parse path when
+// SetReuseFrames is in effect.
+func TestReadFrameRSTStreamNoAllocsWhenReused(t *testing.T) {
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteRSTStream(1, ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	rbuf := bytes.NewReader(encoded)
+	fr := NewFramer(io.Discard, rbuf)
+	fr.SetReuseFrames()
+
+	// Warm up the read buffer so its growth does not count toward the
+	// measurement.
+	rbuf.Reset(encoded)
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	allocs := testing.AllocsPerRun(50, func() {
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("ReadFrame for RST_STREAM allocates %v objects/op; want 0", allocs)
+	}
+}
+
+// TestReadFrameRSTStreamDistinctWithoutReuse asserts the
+// pre-SetReuseFrames contract: without opting in, each parsed
+// RST_STREAM returns a distinct *RSTStreamFrame whose fields remain
+// valid after a subsequent ReadFrame.
+func TestReadFrameRSTStreamDistinctWithoutReuse(t *testing.T) {
+	fr, buf := testFramer()
+
+	if err := fr.WriteRSTStream(1, ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	first, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRST := first.(*RSTStreamFrame)
+
+	buf.Reset()
+	if err := fr.WriteRSTStream(3, ErrCodeProtocol); err != nil {
+		t.Fatal(err)
+	}
+	second, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRST := second.(*RSTStreamFrame)
+
+	if firstRST == secondRST {
+		t.Errorf("without SetReuseFrames, expected distinct pointers; got same: %p", firstRST)
+	}
+	if firstRST.StreamID != 1 || firstRST.ErrCode != ErrCodeCancel {
+		t.Errorf("first RST mutated after second ReadFrame: %+v; want StreamID=1 ErrCode=CANCEL", firstRST)
+	}
+	if secondRST.StreamID != 3 || secondRST.ErrCode != ErrCodeProtocol {
+		t.Errorf("second RST = %+v; want StreamID=3 ErrCode=PROTOCOL", secondRST)
+	}
+}
+
 // TestReadFrameReusesHeadersFrame verifies that ReadFrame returns
 // the same *HeadersFrame pointer for every HEADERS parsed when
 // SetReuseFrames is in effect.

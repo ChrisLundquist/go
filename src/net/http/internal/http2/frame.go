@@ -533,6 +533,7 @@ type frameCache struct {
 	windowUpdateFrame WindowUpdateFrame
 	headersFrame      HeadersFrame
 	metaHeadersFrame  MetaHeadersFrame
+	rstStreamFrame    RSTStreamFrame
 }
 
 func (fc *frameCache) getDataFrame() *DataFrame {
@@ -561,6 +562,13 @@ func (fc *frameCache) getMetaHeadersFrame() *MetaHeadersFrame {
 		return &MetaHeadersFrame{}
 	}
 	return &fc.metaHeadersFrame
+}
+
+func (fc *frameCache) getRSTStreamFrame() *RSTStreamFrame {
+	if fc == nil {
+		return &RSTStreamFrame{}
+	}
+	return &fc.rstStreamFrame
 }
 
 // maxRetainedMetaFields caps the capacity of the Fields backing array
@@ -1526,12 +1534,23 @@ func (f *Framer) WritePriorityUpdate(streamID uint32, priority string) error {
 
 // A RSTStreamFrame allows for abnormal termination of a stream.
 // See https://httpwg.org/specs/rfc7540.html#rfc.section.6.4
+//
+// When [Framer.SetReuseFrames] is in effect, the same *RSTStreamFrame
+// is returned by every (*Framer).ReadFrame call that parses a
+// RST_STREAM and its fields are overwritten on each call, so callers
+// must consume the StreamID and ErrCode fields before the next
+// ReadFrame and must not retain the pointer.
 type RSTStreamFrame struct {
 	FrameHeader
 	ErrCode ErrCode
 }
 
-func parseRSTStreamFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+// parseRSTStreamFrame populates the *RSTStreamFrame returned by
+// frameCache.getRSTStreamFrame. When [Framer.SetReuseFrames] is in
+// effect, that struct is reused across ReadFrame calls; the composite
+// literal reset overwrites every field, so stale data from a previous
+// frame cannot leak even if a field is added later.
+func parseRSTStreamFrame(fc *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if len(p) != 4 {
 		countError("frame_rststream_bad_len")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -1540,7 +1559,12 @@ func parseRSTStreamFrame(_ *frameCache, fh FrameHeader, countError func(string),
 		countError("frame_rststream_zero_stream")
 		return nil, ConnectionError(ErrCodeProtocol)
 	}
-	return &RSTStreamFrame{fh, ErrCode(binary.BigEndian.Uint32(p[:4]))}, nil
+	rsf := fc.getRSTStreamFrame()
+	*rsf = RSTStreamFrame{
+		FrameHeader: fh,
+		ErrCode:     ErrCode(binary.BigEndian.Uint32(p[:4])),
+	}
+	return rsf, nil
 }
 
 // WriteRSTStream writes a RST_STREAM frame.
