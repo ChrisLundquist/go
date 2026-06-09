@@ -3520,6 +3520,16 @@ func benchLargeDownloadRoundTrip(b *testing.B, frameSize uint32) {
 		b.Fatal(err)
 	}
 
+	// Drain with a fixed reused buffer rather than io.ReadAll:
+	// ReadAll grows a contiguous buffer to the full transfer size,
+	// and that harness allocation dominates the benchmark (the bulk
+	// of the measured allocations, GC cycles, and memclr CPU time),
+	// hiding the HTTP/2 stack costs this benchmark exists to observe.
+	// (io.Copy(io.Discard, ...) is not used because io.Discard drains
+	// in 8KB chunks, which changes the flow-control read pattern
+	// under measurement.)
+	drainBuf := make([]byte, 1<<20)
+
 	b.N = 3
 	b.SetBytes(transferSize)
 	b.ResetTimer()
@@ -3532,9 +3542,19 @@ func benchLargeDownloadRoundTrip(b *testing.B, frameSize uint32) {
 			}
 			b.Fatalf("RoundTrip err = %v; want nil", err)
 		}
-		data, _ := io.ReadAll(res.Body)
-		if len(data) != transferSize {
-			b.Fatalf("Response length invalid")
+		var n int64
+		for {
+			nr, err := res.Body.Read(drainBuf)
+			n += int64(nr)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				b.Fatalf("Body.Read err = %v; want nil", err)
+			}
+		}
+		if n != transferSize {
+			b.Fatalf("Response length = %d; want %d", n, int64(transferSize))
 		}
 		res.Body.Close()
 		if res.StatusCode != http.StatusOK {
