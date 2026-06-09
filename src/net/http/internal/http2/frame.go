@@ -366,6 +366,83 @@ type Framer struct {
 	debugWriteLoggerf func(string, ...any)
 
 	frameCache *frameCache // nil if frames aren't reused (default)
+
+	// metaState holds the transient state of an in-flight
+	// readMetaFrame call. It is reset at the start of every call and
+	// cleared again on return (endReadMetaFrame). Keeping this state
+	// on the Framer instead of in locals captured by the hpack
+	// SetEmitFunc closure avoids allocating a closure record and
+	// heap-boxing the three mutated captures on every meta frame
+	// parsed.
+	metaState struct {
+		mh         *MetaHeadersFrame // nil when no call is in flight
+		remainSize uint32
+		sawRegular bool
+		invalid    error // pseudo header field errors
+	}
+
+	// metaEmitFn is fr.emitMetaField bound once, on the first
+	// readMetaFrame call. Binding a method value allocates, so it is
+	// done once per Framer rather than once per frame.
+	metaEmitFn func(hpack.HeaderField)
+}
+
+// emitMetaField is the hpack decoder emit callback used by
+// readMetaFrame, with its state in fr.metaState. If no readMetaFrame
+// call is in flight — possible only through a stray write to the
+// exported ReadMetaHeaders decoder, which stays bound to this method
+// — the nil-mh guard makes it a no-op instead of a mutation of the
+// previously returned frame.
+func (fr *Framer) emitMetaField(hf hpack.HeaderField) {
+	st := &fr.metaState
+	if st.mh == nil {
+		return
+	}
+	hdec := fr.ReadMetaHeaders
+	if VerboseLogs && fr.logReads {
+		fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
+	}
+	if !httpguts.ValidHeaderFieldValue(hf.Value) {
+		// Don't include the value in the error, because it may be sensitive.
+		st.invalid = headerFieldValueError(hf.Name)
+	}
+	isPseudo := strings.HasPrefix(hf.Name, ":")
+	if isPseudo {
+		if st.sawRegular {
+			st.invalid = errPseudoAfterRegular
+		}
+	} else {
+		st.sawRegular = true
+		if !validWireHeaderFieldName(hf.Name) {
+			st.invalid = headerFieldNameError(hf.Name)
+		}
+	}
+
+	if st.invalid != nil {
+		hdec.SetEmitEnabled(false)
+		return
+	}
+
+	size := hf.Size()
+	if size > st.remainSize {
+		hdec.SetEmitEnabled(false)
+		st.mh.Truncated = true
+		st.remainSize = 0
+		return
+	}
+	st.remainSize -= size
+
+	st.mh.Fields = append(st.mh.Fields, hf)
+}
+
+// endReadMetaFrame is deferred by readMetaFrame and runs on every
+// return path (a plain method-call defer, so it is open-coded and
+// does not allocate). Clearing metaState.mh releases the returned
+// frame for collection on long-idle connections without SetReuseFrames
+// and arms emitMetaField's nil-mh guard against stray decoder writes.
+func (fr *Framer) endReadMetaFrame() {
+	fr.metaState.mh = nil
+	fr.metaState.invalid = nil
 }
 
 func (fr *Framer) maxHeaderListSize() uint32 {
@@ -1858,51 +1935,21 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		HeadersFrame: hf,
 	}
 	mh.Fields = fields[:0]
-	var remainSize = fr.maxHeaderListSize()
-	var sawRegular bool
-
-	var invalid error // pseudo header field errors
+	fr.metaState.mh = mh
+	fr.metaState.remainSize = fr.maxHeaderListSize()
+	fr.metaState.sawRegular = false
+	fr.metaState.invalid = nil
 	hdec := fr.ReadMetaHeaders
 	hdec.SetEmitEnabled(true)
 	hdec.SetMaxStringLength(fr.maxHeaderStringLen())
-	hdec.SetEmitFunc(func(hf hpack.HeaderField) {
-		if VerboseLogs && fr.logReads {
-			fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
-		}
-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
-			// Don't include the value in the error, because it may be sensitive.
-			invalid = headerFieldValueError(hf.Name)
-		}
-		isPseudo := strings.HasPrefix(hf.Name, ":")
-		if isPseudo {
-			if sawRegular {
-				invalid = errPseudoAfterRegular
-			}
-		} else {
-			sawRegular = true
-			if !validWireHeaderFieldName(hf.Name) {
-				invalid = headerFieldNameError(hf.Name)
-			}
-		}
-
-		if invalid != nil {
-			hdec.SetEmitEnabled(false)
-			return
-		}
-
-		size := hf.Size()
-		if size > remainSize {
-			hdec.SetEmitEnabled(false)
-			mh.Truncated = true
-			remainSize = 0
-			return
-		}
-		remainSize -= size
-
-		mh.Fields = append(mh.Fields, hf)
-	})
-	// Lose reference to MetaHeadersFrame:
-	defer hdec.SetEmitFunc(func(hf hpack.HeaderField) {})
+	if fr.metaEmitFn == nil {
+		fr.metaEmitFn = fr.emitMetaField
+	}
+	hdec.SetEmitFunc(fr.metaEmitFn)
+	// Lose the reference to mh on every return path; see
+	// endReadMetaFrame.
+	defer fr.endReadMetaFrame()
+	invalid := &fr.metaState.invalid
 
 	var hc headersOrContinuation = hf
 	for {
@@ -1916,7 +1963,7 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		// exceeded the max header list size (in which case remainSize is 0),
 		// or a frame whose encoded size is more than twice the remaining
 		// header list bytes we're willing to accept.
-		if int64(len(frag)) > int64(2*remainSize) {
+		if int64(len(frag)) > int64(2*fr.metaState.remainSize) {
 			if VerboseLogs {
 				log.Printf("http2: header list too large")
 			}
@@ -1928,9 +1975,9 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 		// Also close the connection after any CONTINUATION frame following an
 		// invalid header, since we stop tracking the size of the headers after
 		// an invalid one.
-		if invalid != nil {
+		if *invalid != nil {
 			if VerboseLogs {
-				log.Printf("http2: invalid header: %v", invalid)
+				log.Printf("http2: invalid header: %v", *invalid)
 			}
 			// It would be nice to send a RST_STREAM before sending the GOAWAY,
 			// but the structure of the server's frame writer makes this difficult.
@@ -1966,12 +2013,12 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	if err := hdec.Close(); err != nil {
 		return mh, ConnectionError(ErrCodeCompression)
 	}
-	if invalid != nil {
-		fr.errDetail = invalid
+	if *invalid != nil {
+		fr.errDetail = *invalid
 		if VerboseLogs {
-			log.Printf("http2: invalid header: %v", invalid)
+			log.Printf("http2: invalid header: %v", *invalid)
 		}
-		return nil, StreamError{mh.StreamID, ErrCodeProtocol, invalid}
+		return nil, StreamError{mh.StreamID, ErrCodeProtocol, *invalid}
 	}
 	if err := mh.checkPseudos(); err != nil {
 		fr.errDetail = err

@@ -1486,6 +1486,103 @@ func TestReadMetaFrameFieldsRetentionCap(t *testing.T) {
 	}
 }
 
+// TestReadMetaFrameClearsMetaState verifies that readMetaFrame leaves
+// no reference to the returned frame in fr.metaState: the frame must
+// stay collectable on long-idle connections without SetReuseFrames,
+// and emitMetaField's nil-mh guard must be armed between calls.
+func TestReadMetaFrameClearsMetaState(t *testing.T) {
+	fr, _ := testFramer()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	writeMetaHeaders(t, fr, 1, ":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if fr.metaState.mh != nil {
+		t.Errorf("fr.metaState.mh = %p after readMetaFrame returned; want nil", fr.metaState.mh)
+	}
+	if fr.metaState.invalid != nil {
+		t.Errorf("fr.metaState.invalid = %v after readMetaFrame returned; want nil", fr.metaState.invalid)
+	}
+}
+
+// TestEmitMetaFieldNilGuard verifies that emitMetaField is a safe
+// no-op when no readMetaFrame call is in flight. The exported
+// ReadMetaHeaders decoder stays bound to the method after
+// readMetaFrame returns, so a stray Write to the decoder must not
+// mutate the previously returned frame.
+func TestEmitMetaFieldNilGuard(t *testing.T) {
+	fr, buf := testFramer()
+	fr.SetReuseFrames()
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+
+	writeMetaHeaders(t, fr, 1, ":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+	f, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mh := f.(*MetaHeadersFrame)
+	wantFields := len(mh.Fields)
+
+	// Direct stray call: must not panic, must not mutate mh.
+	fr.emitMetaField(hpack.HeaderField{Name: "x-stray", Value: "v"})
+	// Stray decoder write: the decoder is still bound to emitMetaField.
+	buf.Reset()
+	if _, err := fr.ReadMetaHeaders.Write(encodeHeaderRaw(t, "x-stray", "v")); err != nil {
+		t.Fatal(err)
+	}
+	if len(mh.Fields) != wantFields {
+		t.Errorf("stray emit mutated cached frame: len(Fields) = %d, want %d", len(mh.Fields), wantFields)
+	}
+}
+
+// TestReadMetaFrameNoAllocsWhenReused locks in the zero-allocation
+// invariant for the meta-headers read path when SetReuseFrames is in
+// effect, mirroring TestReadFrameWindowUpdateNoAllocsWhenReused.
+//
+// The header block is chosen so steady-state decoding allocates
+// nothing: every field is either an exact static-table match or a
+// one-byte literal (the runtime does not heap-allocate single-byte
+// strings), so the measurement isolates the frame, Fields, and emit
+// machinery that this package owns.
+func TestReadMetaFrameNoAllocsWhenReused(t *testing.T) {
+	block := encodeHeaderRaw(t, ":method", "GET", ":path", "/", ":scheme", "http", ":authority", "x")
+	var enc bytes.Buffer
+	if err := NewFramer(&enc, nil).WriteHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: block,
+		EndHeaders:    true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	encoded := enc.Bytes()
+
+	rbuf := bytes.NewReader(encoded)
+	fr := NewFramer(io.Discard, rbuf)
+	fr.ReadMetaHeaders = hpack.NewDecoder(initialHeaderTableSize, nil)
+	fr.SetReuseFrames()
+
+	// Warm up the read buffer, the Fields backing array, the bound
+	// emit method, and the decoder's dynamic table so one-time growth
+	// does not count toward the measurement.
+	for range 3 {
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(50, func() {
+		rbuf.Reset(encoded)
+		if _, err := fr.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("ReadFrame for HEADERS via readMetaFrame allocates %v objects/op; want 0", allocs)
+	}
+}
+
 func TestWritePing(t *testing.T)    { testWritePing(t, false) }
 func TestWritePingAck(t *testing.T) { testWritePing(t, true) }
 
