@@ -1008,6 +1008,10 @@ var writeResHeadersPool = sync.Pool{
 	New: func() any { return new(writeResHeaders) },
 }
 
+var writeWindowUpdatePool = sync.Pool{
+	New: func() any { return new(writeWindowUpdate) },
+}
+
 // writeDataFromHandler writes DATA response frames from a handler on
 // the given stream.
 func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStream bool) error {
@@ -1152,7 +1156,7 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 		switch st.state {
 		case stateHalfClosedLocal:
 			switch wr.write.(type) {
-			case StreamError, handlerPanicRST, writeWindowUpdate:
+			case StreamError, handlerPanicRST, *writeWindowUpdate:
 				// RFC 7540 Section 5.1 allows sending RST_STREAM, PRIORITY, and WINDOW_UPDATE
 				// in this state. (We never send PRIORITY from the server, so that is not checked.)
 			default:
@@ -1259,11 +1263,14 @@ func (sc *serverConn) wroteFrame(res frameWriteResult) {
 	// the handler side cannot do this reliably for stream-ending
 	// writes, because its select is woken by the stream's closeWaiter
 	// (closed above, before the reply lands) rather than the reply.
-	if hd, ok := wr.write.(*writeResHeaders); ok {
+	switch w := wr.write.(type) {
+	case *writeResHeaders:
 		// Clear before pooling so the header map (which can hold
 		// sensitive values) does not stay reachable from the pool.
-		*hd = writeResHeaders{}
-		writeResHeadersPool.Put(hd)
+		*w = writeResHeaders{}
+		writeResHeadersPool.Put(w)
+	case *writeWindowUpdate:
+		writeWindowUpdatePool.Put(w)
 	}
 
 	sc.scheduleFrameWrite()
@@ -2449,8 +2456,10 @@ func (sc *serverConn) sendWindowUpdate(st *stream, n int) {
 	if send == 0 {
 		return
 	}
+	wu := writeWindowUpdatePool.Get().(*writeWindowUpdate)
+	*wu = writeWindowUpdate{streamID: streamID, n: uint32(send)}
 	sc.writeFrame(FrameWriteRequest{
-		write:  writeWindowUpdate{streamID: streamID, n: uint32(send)},
+		write:  wu,
 		stream: st,
 	})
 }

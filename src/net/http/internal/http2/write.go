@@ -327,14 +327,19 @@ func (w write100ContinueHeadersFrame) staysWithinBuffer(max int) bool {
 	return 9+2*(len(":status")+len("100")) <= max
 }
 
+// A writeWindowUpdate is always created via writeWindowUpdatePool and
+// recycled by the serve goroutine in wroteFrame; storing a pointer in
+// FrameWriteRequest.write avoids boxing a fresh heap copy into the
+// interface for every WINDOW_UPDATE queued (two per body chunk read
+// by a handler: stream-level and conn-level).
 type writeWindowUpdate struct {
 	streamID uint32 // or 0 for conn-level
 	n        uint32
 }
 
-func (wu writeWindowUpdate) staysWithinBuffer(max int) bool { return frameHeaderLen+4 <= max }
+func (wu *writeWindowUpdate) staysWithinBuffer(max int) bool { return frameHeaderLen+4 <= max }
 
-func (wu writeWindowUpdate) writeFrame(ctx writeContext) error {
+func (wu *writeWindowUpdate) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
 }
 
