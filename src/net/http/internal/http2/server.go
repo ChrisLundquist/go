@@ -1004,6 +1004,10 @@ var writeDataPool = sync.Pool{
 	New: func() any { return new(writeData) },
 }
 
+var writeResHeadersPool = sync.Pool{
+	New: func() any { return new(writeResHeaders) },
+}
+
 // writeDataFromHandler writes DATA response frames from a handler on
 // the given stream.
 func (sc *serverConn) writeDataFromHandler(stream *stream, data []byte, endStream bool) error {
@@ -1248,6 +1252,19 @@ func (sc *serverConn) wroteFrame(res frameWriteResult) {
 
 	// Reply (if requested) to unblock the ServeHTTP goroutine.
 	wr.replyToWriter(res.err)
+
+	// The write completed and the reply above was the last reader of
+	// the frame's payload, so pooled write types can be recycled here.
+	// Recycling on the serve goroutine catches every written frame;
+	// the handler side cannot do this reliably for stream-ending
+	// writes, because its select is woken by the stream's closeWaiter
+	// (closed above, before the reply lands) rather than the reply.
+	if hd, ok := wr.write.(*writeResHeaders); ok {
+		// Clear before pooling so the header map (which can hold
+		// sensitive values) does not stay reachable from the pool.
+		*hd = writeResHeaders{}
+		writeResHeadersPool.Put(hd)
+	}
 
 	sc.scheduleFrameWrite()
 }
@@ -2616,7 +2633,8 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		}
 
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
-		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
+		hd := writeResHeadersPool.Get().(*writeResHeaders)
+		*hd = writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
 			h:             rws.snapHeader,
@@ -2624,7 +2642,8 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			contentType:   ctype,
 			contentLength: clen,
 			date:          date,
-		})
+		}
+		err = rws.conn.writeHeaders(rws.stream, hd)
 		if err != nil {
 			return 0, err
 		}
@@ -2651,12 +2670,14 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	}
 
 	if rws.handlerDone && hasNonemptyTrailers {
-		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
+		hd := writeResHeadersPool.Get().(*writeResHeaders)
+		*hd = writeResHeaders{
 			streamID:  rws.stream.id,
 			h:         rws.handlerHeader,
 			trailers:  rws.trailers,
 			endStream: true,
-		})
+		}
+		err = rws.conn.writeHeaders(rws.stream, hd)
 		return len(p), err
 	}
 	return len(p), nil
@@ -2875,12 +2896,14 @@ func (rws *responseWriterState) writeHeader(code int) {
 			h.Del("Transfer-Encoding")
 		}
 
-		rws.conn.writeHeaders(rws.stream, &writeResHeaders{
+		hd := writeResHeadersPool.Get().(*writeResHeaders)
+		*hd = writeResHeaders{
 			streamID:    rws.stream.id,
 			httpResCode: code,
 			h:           h,
 			endStream:   rws.handlerDone && !rws.hasTrailers(),
-		})
+		}
+		rws.conn.writeHeaders(rws.stream, hd)
 
 		return
 	}
